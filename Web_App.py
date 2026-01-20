@@ -64,7 +64,7 @@ def get_all_nifty_stocks():
         
     my_bar.empty()
     return list(all_tickers)
-
+'''
 # --- 3. ANALYZE STOCK (With Retry Logic) ---
 def analyze_single_stock(symbol):
     try:
@@ -150,6 +150,84 @@ def analyze_single_stock(symbol):
             "ROE %": round(roe_pct, 1),
             "P/E": round(pe, 1) if pd.notnull(pe) else "N/A",
             "Raw_Score": score # Hidden column for sorting
+        }
+
+    except Exception as e:
+        return {"Ticker": symbol, "Error": str(e)}
+'''
+
+# --- 3. ANALYZE STOCK (Fixed: Removed Session Override) ---
+def analyze_single_stock(symbol):
+    try:
+        # Random sleep is still good to avoid hitting rate limits
+        time.sleep(random.uniform(0.1, 0.5))
+        
+        # FIX: Do NOT pass a custom session. Let yfinance handle it internally.
+        stock = yf.Ticker(symbol)
+        
+        # Fast Info Fetch
+        info = stock.info
+        
+        # Check if data is valid
+        if not info or 'currentPrice' not in info:
+            return {"Ticker": symbol, "Error": "No Data/Blocked"}
+
+        # Fundamentals
+        price = info.get('currentPrice', 0)
+        roe = info.get('returnOnEquity', 0)
+        debt_eq = info.get('debtToEquity', 0)
+        peg = info.get('pegRatio', float('nan'))
+        pe = info.get('trailingPE', float('nan'))
+        
+        roe_pct = roe * 100 if roe else 0
+        debt_ratio = debt_eq / 100 if debt_eq > 10 else debt_eq
+
+        # --- SCORING LOGIC ---
+        score = 0
+        
+        # Rule 1: Quality (ROE > 12%)
+        if roe_pct > 12: score += 1
+        
+        # Rule 2: Safety (Debt/Eq < 1.5)
+        if debt_ratio < 1.5: score += 1
+        
+        # Rule 3: Growth (PEG < 3 or NaN)
+        if pd.isna(peg) or (0 < peg < 3.0): score += 1
+            
+        # Rule 4: Value (P/E < 40)
+        if pd.notnull(pe) and 0 < pe < 40: score += 1
+
+        verdict = "Avoid"
+        if score == 4: verdict = "STRONG BUY"
+        elif score == 3: verdict = "Quality Buy"
+        elif score == 2: verdict = "Watchlist"
+
+        # --- TECHNICALS ---
+        sl, tgt = "N/A", "N/A"
+        if score >= 2:
+            try:
+                hist = stock.history(period="1mo")
+                if not hist.empty and len(hist) > 14:
+                    hist['tr'] = np.maximum((hist['High'] - hist['Low']), 
+                                          np.maximum(abs(hist['High'] - hist['Close'].shift(1)), 
+                                                     abs(hist['Low'] - hist['Close'].shift(1))))
+                    atr = hist['tr'].tail(14).mean()
+                    sl = round(price - (2.0 * atr), 2)
+                    tgt = round(price + (4.0 * atr), 2)
+            except Exception:
+                pass 
+
+        return {
+            "Ticker": symbol.replace('.NS', ''),
+            "Price": price,
+            "Score": f"{score}/4",
+            "Verdict": verdict,
+            "Stop Loss": sl,
+            "Target": tgt,
+            "PEG Ratio": round(peg, 2) if pd.notnull(peg) else "N/A",
+            "ROE %": round(roe_pct, 1),
+            "P/E": round(pe, 1) if pd.notnull(pe) else "N/A",
+            "Raw_Score": score 
         }
 
     except Exception as e:
