@@ -1,4 +1,5 @@
 streamlit
 pandas
 requests
-yfinance
+yfinance>=0.2.36
+curl_cffi
