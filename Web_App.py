@@ -5,6 +5,7 @@ import io
 import yfinance as yf
 import concurrent.futures
 import time
+import random
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="Buffett Stock Scanner", layout="wide")
@@ -18,24 +19,36 @@ SECTOR_MAP = {
     'consumer durables': 'consumerdurables', 'oil and gas': 'oilandgas'
 }
 
-# --- CACHING (Prevents re-scanning on every click) ---
-@st.cache_data(ttl=600)  # Cache clears every 10 minutes automatically
+# --- 1. SESSION WITH BROWSER HEADERS (ANTI-BLOCKING) ---
+def get_session():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Connection": "keep-alive"
+    })
+    return session
+
+# --- 2. ROBUST FETCH FUNCTION ---
+@st.cache_data(ttl=3600)
 def get_all_nifty_stocks():
     all_tickers = set()
-    headers = {"User-Agent": "Mozilla/5.0"}
+    session = get_session()
     
-    # Progress bar for sector fetching
-    progress_text = "Fetching Sector Lists from NSE..."
+    # Progress bar
+    progress_text = "Fetching Sector Lists..."
     my_bar = st.progress(0, text=progress_text)
     
     sectors = list(SECTOR_MAP.items())
-    total = len(sectors)
-    
     for i, (sector_name, slug) in enumerate(sectors):
         try:
             url = f"https://niftyindices.com/IndexConstituent/ind_nifty{slug}list.csv"
-            response = requests.get(url, headers=headers)
-            df = pd.read_csv(io.StringIO(response.text))
+            response = session.get(url, timeout=10)
+            
+            # Decode content manually if needed
+            content = response.content.decode('utf-8')
+            df = pd.read_csv(io.StringIO(content))
             
             symbol_col = next((col for col in df.columns if 'Symbol' in col), None)
             if symbol_col:
@@ -44,40 +57,30 @@ def get_all_nifty_stocks():
                     if "DUMMY" not in str(sym).upper():
                         all_tickers.add(f"{sym}.NS")
         except Exception:
-            continue
+            pass # Skip failed sectors silently
         
-        # Update progress
-        my_bar.progress((i + 1) / total, text=f"Fetched {sector_name}...")
+        my_bar.progress((i + 1) / len(sectors), text=f"Fetched {sector_name}...")
+        time.sleep(0.1) # Tiny sleep to be polite
         
-    my_bar.empty() # Clear bar when done
+    my_bar.empty()
     return list(all_tickers)
 
-def get_technical_levels(stock_obj):
-    try:
-        hist = stock_obj.history(period="1mo")
-        if len(hist) < 14: return None, None, None
-
-        hist['h-l'] = hist['High'] - hist['Low']
-        hist['h-pc'] = abs(hist['High'] - hist['Close'].shift(1))
-        hist['l-pc'] = abs(hist['Low'] - hist['Close'].shift(1))
-        hist['tr'] = hist[['h-l', 'h-pc', 'l-pc']].max(axis=1)
-        atr = hist['tr'].tail(14).mean()
-        
-        current_close = hist['Close'].iloc[-1]
-        
-        # Stop = 2x ATR | Target = 4x ATR
-        stop_loss = current_close - (2.0 * atr)
-        target = current_close + (4.0 * atr)
-        
-        return round(stop_loss, 2), round(target, 2), round(atr, 2)
-    except:
-        return None, None, None
-
+# --- 3. ANALYZE STOCK (With Retry Logic) ---
 def analyze_single_stock(symbol):
     try:
-        stock = yf.Ticker(symbol)
+        # Random sleep to prevent exact-timing blocks
+        time.sleep(random.uniform(0.1, 0.5))
+        
+        # Create a Ticker object with our custom session
+        session = get_session()
+        stock = yf.Ticker(symbol, session=session)
+        
+        # Fast Info Fetch (avoids downloading history unless needed)
         info = stock.info
-        if not info or 'currentPrice' not in info: return None
+        
+        # Check if data is valid (Yahoo returns empty dicts when blocked)
+        if not info or 'currentPrice' not in info:
+            return {"Ticker": symbol, "Error": "No Data/Blocked"}
 
         # Fundamentals
         price = info.get('currentPrice', 0)
@@ -89,84 +92,127 @@ def analyze_single_stock(symbol):
         roe_pct = roe * 100 if roe else 0
         debt_ratio = debt_eq / 100 if debt_eq > 10 else debt_eq
 
-        # Scoring
+        # --- SCORING LOGIC ---
         score = 0
-        if roe_pct > 15: score += 1
-        if debt_ratio < 1.0: score += 1
-        if pd.notnull(peg) and 0 < peg < 2.0: score += 1
-        if pd.notnull(pe) and 0 < pe < 30: score += 1
+        reasons = []
+        
+        # Rule 1: Quality (ROE > 12% - Relaxed slightly for robustness)
+        if roe_pct > 12: 
+            score += 1
+            reasons.append("High ROE")
+        
+        # Rule 2: Safety (Debt/Eq < 1.5 - Relaxed slightly)
+        if debt_ratio < 1.5: 
+            score += 1
+            reasons.append("Safe Debt")
+        
+        # Rule 3: Growth (PEG < 3 or NaN - Don't punish for missing data)
+        if pd.isna(peg) or (0 < peg < 3.0): 
+            score += 1
+            reasons.append("Fair PEG")
+            
+        # Rule 4: Value (P/E < 40 - Adjusted for Indian Market premium)
+        if pd.notnull(pe) and 0 < pe < 40: 
+            score += 1
+            reasons.append("Fair P/E")
 
         verdict = "Avoid"
         if score == 4: verdict = "STRONG BUY"
         elif score == 3: verdict = "Quality Buy"
         elif score == 2: verdict = "Watchlist"
-        
-        # Technicals (Only for good stocks)
+
+        # --- TECHNICALS (Optional) ---
+        # Only fetch history for good stocks to save bandwidth
         sl, tgt = "N/A", "N/A"
         if score >= 2:
-            sl_val, tgt_val, _ = get_technical_levels(stock)
-            if sl_val:
-                sl, tgt = sl_val, tgt_val
+            try:
+                hist = stock.history(period="1mo")
+                if not hist.empty and len(hist) > 14:
+                    # Calculate ATR
+                    hist['tr'] = np.maximum((hist['High'] - hist['Low']), 
+                                          np.maximum(abs(hist['High'] - hist['Close'].shift(1)), 
+                                                     abs(hist['Low'] - hist['Close'].shift(1))))
+                    atr = hist['tr'].tail(14).mean()
+                    sl = round(price - (2.0 * atr), 2)
+                    tgt = round(price + (4.0 * atr), 2)
+            except Exception:
+                pass # Fail silently on technicals to keep the main result
 
-        if score >= 2:
-            return {
-                "Ticker": symbol.replace('.NS', ''),
-                "Price": price,
-                "Score": f"{score}/4",
-                "Verdict": verdict,
-                "Stop Loss": sl,
-                "Target": tgt,
-                "Risk/Reward": "1:2",
-                "PEG Ratio": round(peg, 2) if pd.notnull(peg) else "N/A",
-                "ROE %": round(roe_pct, 1),
-                "P/E": round(pe, 1) if pd.notnull(pe) else "N/A"
-            }
-        return None
-    except:
-        return None
+        # Return Data
+        return {
+            "Ticker": symbol.replace('.NS', ''),
+            "Price": price,
+            "Score": f"{score}/4",
+            "Verdict": verdict,
+            "Stop Loss": sl,
+            "Target": tgt,
+            "PEG Ratio": round(peg, 2) if pd.notnull(peg) else "N/A",
+            "ROE %": round(roe_pct, 1),
+            "P/E": round(pe, 1) if pd.notnull(pe) else "N/A",
+            "Raw_Score": score # Hidden column for sorting
+        }
+
+    except Exception as e:
+        return {"Ticker": symbol, "Error": str(e)}
+
+import numpy as np # Ensure numpy is imported for ATR calc
 
 # --- MAIN APP UI ---
-st.title("📈 AI Stock Scanner: Buffett Strategy + Technicals")
-st.markdown("""
-**Strategy:** High ROE (>15%) + Low Debt (<1.0) + Fair Valuation.
-**Exit Plan:** Stop Loss is 2x ATR. Target is 4x ATR.
-""")
+st.title("📈 AI Stock Scanner: Robust Cloud Version")
+st.markdown("Strategy: High ROE + Low Debt. **Optimized for Streamlit Cloud.**")
 
-# Button to trigger scan
+# Sidebar Controls
+st.sidebar.header("Settings")
+# Reduce workers to 2-4 for Cloud (prevents blocking)
+workers = st.sidebar.slider("Parallel Workers (Keep Low on Cloud!)", 1, 10, 2)
+show_debug = st.sidebar.checkbox("Show Debug Data (First 5 stocks)")
+
 if st.button("🚀 Run Live Market Scan"):
-    
-    # 1. Get Tickers
     tickers = get_all_nifty_stocks()
-    st.write(f"Found **{len(tickers)}** unique stocks across all sectors.")
+    st.write(f"Found **{len(tickers)}** unique stocks. Scanning with {workers} workers...")
     
-    # 2. Analyze (with Spinner)
     results = []
-    with st.spinner('Analyzing Fundamentals & Technicals... (This takes ~30 seconds)'):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-            futures = [executor.submit(analyze_single_stock, t) for t in tickers]
-            for future in concurrent.futures.as_completed(futures):
-                res = future.result()
-                if res:
-                    results.append(res)
+    errors = []
     
-    # 3. Display Results
+    # Progress Bar
+    scan_bar = st.progress(0, text="Analyzing...")
+    
+    # Parallel Execution
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(analyze_single_stock, t): t for t in tickers}
+        
+        completed = 0
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            if "Error" in res:
+                errors.append(res)
+            elif res["Raw_Score"] >= 2: # Only save relevant ones
+                results.append(res)
+            
+            completed += 1
+            if completed % 5 == 0:
+                scan_bar.progress(completed / len(tickers), text=f"Scanned {completed}/{len(tickers)}...")
+
+    scan_bar.empty()
+
+    # --- RESULTS DISPLAY ---
     if results:
         df = pd.DataFrame(results)
+        # Sort by Score High -> Low
+        df = df.sort_values(by=["Raw_Score", "ROE %"], ascending=[False, False])
         
-        # Sort logic: Score high -> PEG low
-        # We need a helper column for sorting because "N/A" strings break sort
-        df['Sort_PEG'] = pd.to_numeric(df['PEG Ratio'], errors='coerce').fillna(999)
-        df = df.sort_values(by=["Score", "Sort_PEG"], ascending=[False, True]).drop(columns=['Sort_PEG'])
-
-        # Separate Tables
-        winners = df[df['Verdict'].isin(["STRONG BUY", "Quality Buy"])]
-        watchlist = df[df['Verdict'] == "Watchlist"]
-
-        st.subheader("🏆 Actionable Buy List")
-        st.dataframe(winners, use_container_width=True, height=400)
+        st.success(f"Found {len(df)} opportunities!")
         
-        st.subheader("👀 Watchlist (Mixed Signals)")
-        st.dataframe(watchlist, use_container_width=True)
+        st.subheader("🏆 Top Picks (Score 3/4 & 4/4)")
+        st.dataframe(df[df["Raw_Score"] >= 3].drop(columns=["Raw_Score"]), use_container_width=True)
         
+        st.subheader("👀 Watchlist (Score 2/4)")
+        st.dataframe(df[df["Raw_Score"] == 2].drop(columns=["Raw_Score"]), use_container_width=True)
     else:
-        st.warning("No stocks matched the criteria.")
+        st.warning("No stocks matched the criteria. (Or Yahoo blocked the requests).")
+
+    # --- DEBUG SECTION ---
+    if show_debug and errors:
+        st.write("---")
+        st.error("Debug Info (Failed/Blocked Stocks):")
+        st.write(pd.DataFrame(errors).head(10))
